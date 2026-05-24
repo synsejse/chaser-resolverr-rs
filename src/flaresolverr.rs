@@ -10,9 +10,14 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use tokio::sync::Mutex;
 
 use crate::chaser::ChaserClient;
 use crate::config::BrowserConfig;
@@ -184,15 +189,73 @@ pub struct IndexResponse {
     pub user_agent: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct HealthResponse {
+    /// `"ok"` when the browser is ready, otherwise a short failure reason.
+    /// Kept first + always present for FlareSolverr-client compat — they
+    /// only key off this field.
     pub status: String,
+    pub version: &'static str,
+    pub uptime_seconds: u64,
+    pub chaser_cf_ready: bool,
+    pub sessions: usize,
+    pub fetches_total: u64,
+    pub fetches_failed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_reason: Option<String>,
+}
+
+/// Counters + timestamps surfaced by `/health`. `record_*` is called from
+/// `handle_get` on every fetch outcome.
+#[derive(Clone)]
+struct HealthState {
+    started_at: Instant,
+    fetches_total: Arc<AtomicU64>,
+    fetches_failed: Arc<AtomicU64>,
+    last_success_at: Arc<Mutex<Option<DateTime<Utc>>>>,
+    last_failure: Arc<Mutex<Option<FailureRecord>>>,
+}
+
+struct FailureRecord {
+    at: DateTime<Utc>,
+    reason: String,
+}
+
+impl HealthState {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            fetches_total: Arc::new(AtomicU64::new(0)),
+            fetches_failed: Arc::new(AtomicU64::new(0)),
+            last_success_at: Arc::new(Mutex::new(None)),
+            last_failure: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn record_success(&self) {
+        self.fetches_total.fetch_add(1, Ordering::Relaxed);
+        *self.last_success_at.lock().await = Some(Utc::now());
+    }
+
+    async fn record_failure(&self, reason: impl Into<String>) {
+        self.fetches_total.fetch_add(1, Ordering::Relaxed);
+        self.fetches_failed.fetch_add(1, Ordering::Relaxed);
+        *self.last_failure.lock().await = Some(FailureRecord {
+            at: Utc::now(),
+            reason: reason.into(),
+        });
+    }
 }
 
 #[derive(Clone)]
 struct AppState {
     sessions: SessionManager,
     chaser: ChaserClient,
+    health: HealthState,
 }
 
 pub struct FlareSolverrAPI {
@@ -205,7 +268,11 @@ impl FlareSolverrAPI {
         let chaser = browser_cfg.chaser.clone();
         let sessions = SessionManager::new(browser_cfg, data_dir);
         Self {
-            state: AppState { sessions, chaser },
+            state: AppState {
+                sessions,
+                chaser,
+                health: HealthState::new(),
+            },
         }
     }
 
@@ -229,22 +296,51 @@ async fn index() -> ResponseJson<IndexResponse> {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     debug!("Health check");
-    if state.chaser.is_ready().await {
-        (
-            StatusCode::OK,
-            ResponseJson(HealthResponse {
-                status: STATUS_OK.to_string(),
-            }),
-        )
+
+    let chaser_cf_ready = state.chaser.is_ready().await;
+    let sessions = state.sessions.list_sessions().await.len();
+
+    let last_success_at = state
+        .health
+        .last_success_at
+        .lock()
+        .await
+        .as_ref()
+        .map(rfc3339);
+    let last_failure_snapshot = state.health.last_failure.lock().await;
+    let last_failure_at = last_failure_snapshot.as_ref().map(|f| rfc3339(&f.at));
+    let last_failure_reason = last_failure_snapshot.as_ref().map(|f| f.reason.clone());
+    drop(last_failure_snapshot);
+
+    let (http_status, status_text) = if chaser_cf_ready {
+        (StatusCode::OK, STATUS_OK.to_string())
     } else {
         warn!("Health check failed: chaser-cf browser not ready");
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            ResponseJson(HealthResponse {
-                status: "chaser-cf browser not ready".to_string(),
-            }),
+            "chaser-cf browser not ready".to_string(),
         )
-    }
+    };
+
+    (
+        http_status,
+        ResponseJson(HealthResponse {
+            status: status_text,
+            version: env!("CARGO_PKG_VERSION"),
+            uptime_seconds: state.health.started_at.elapsed().as_secs(),
+            chaser_cf_ready,
+            sessions,
+            fetches_total: state.health.fetches_total.load(Ordering::Relaxed),
+            fetches_failed: state.health.fetches_failed.load(Ordering::Relaxed),
+            last_success_at,
+            last_failure_at,
+            last_failure_reason,
+        }),
+    )
+}
+
+fn rfc3339(dt: &DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 async fn v1_handler(
@@ -264,7 +360,7 @@ async fn v1_handler(
     ctx.info("Incoming request");
 
     let mut response = match req.cmd.as_str() {
-        "request.get" => handle_get(req, sm).await,
+        "request.get" => handle_get(req, sm, &state.health).await,
         "request.post" => handle_post(req).await,
         "sessions.create" => handle_create(req, sm).await,
         "sessions.list" => handle_list(sm).await,
@@ -289,7 +385,7 @@ async fn v1_handler(
     ResponseJson(response)
 }
 
-async fn handle_get(req: V1Request, sm: &SessionManager) -> V1Response {
+async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -> V1Response {
     let url = match req.url {
         Some(ref u) => u.clone(),
         None => return V1Response::error("Parameter 'url' is mandatory for request.get"),
@@ -357,6 +453,7 @@ async fn handle_get(req: V1Request, sm: &SessionManager) -> V1Response {
 
     match fetch_result {
         Ok(response) => {
+            health.record_success().await;
             let solution = Solution {
                 url: response.url,
                 status: response.status,
@@ -374,7 +471,10 @@ async fn handle_get(req: V1Request, sm: &SessionManager) -> V1Response {
                 .with_solution(solution)
                 .with_session(session_id)
         }
-        Err(e) => V1Response::error(&format!("Challenge failed: {}", e)),
+        Err(e) => {
+            health.record_failure(format!("{}: {}", url, e)).await;
+            V1Response::error(&format!("Challenge failed: {}", e))
+        }
     }
 }
 
