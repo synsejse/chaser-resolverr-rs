@@ -9,10 +9,9 @@
 use anyhow::Result;
 use chrono::Utc;
 use log::debug;
-use std::time::Instant;
 use url::Url;
 
-use crate::chaser::{ChaserClient, WafSession};
+use crate::chaser::{ChaserClient, WafSummary};
 use crate::config::{ProxyConfig, SessionConfig};
 use crate::session::{SessionData, StoredCookie};
 
@@ -24,8 +23,8 @@ pub struct FetchResponse {
     pub user_agent: String,
 }
 
-/// chaser-cf's `source` mode doesn't surface the upstream HTTP status,
-/// so we report 200 on a successful body fetch.
+/// Fallback when Chrome's Performance API doesn't surface a navigation
+/// status (older Chrome, some cross-origin redirects).
 const DEFAULT_HTTP_STATUS: u16 = 200;
 
 pub async fn fetch(
@@ -34,51 +33,44 @@ pub async fn fetch(
     cfg: &SessionConfig,
     state: &mut SessionData,
     url: &str,
-    timeout: u64,
     return_only_cookies: bool,
 ) -> Result<FetchResponse> {
     let host = Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(String::from));
-    let started = Instant::now();
 
     if needs_refresh(state, cfg, host.as_deref()) {
-        // waf-session polls indefinitely for a cf_clearance cookie. On a
-        // non-CF URL (e.g. Prowlarr's /v1/ping connectivity test) that
-        // cookie never appears, so without a tight cap on this call we'd
-        // burn the entire `maxTimeout` and fail the request. Cap at 1/3
-        // of the budget — a real CF solve usually takes 5-10s anyway.
-        let waf_timeout = (timeout / 3).max(5);
-        debug!(
-            "Refreshing chaser-cf waf-session for {} (cap {}s)",
-            url, waf_timeout
-        );
-        match chaser.waf_session(url, proxy, waf_timeout).await {
+        debug!("Refreshing chaser-cf waf-session for {}", url);
+        match chaser.waf_session(url, proxy).await {
             Ok(session) => apply_waf_session(state, &session, url),
             Err(e) => debug!(
-                "waf-session for {} did not return clearance ({}); proceeding without cookie refresh",
+                "waf-session for {} returned no clearance ({}); proceeding without cookie refresh",
                 url, e
             ),
         }
-        // Record the attempt either way — for non-CF hosts this stops us
-        // retrying waf-session on every request until the TTL expires.
+        // Record the attempt either way so we don't re-hammer waf-session
+        // on every request to a confirmed non-CF host.
         state.clearance_fetched_at = Some(Utc::now().timestamp());
         state.clearance_host = host;
     } else {
         debug!("Reusing cached chaser-cf clearance for {}", url);
     }
 
-    let body = if return_only_cookies {
-        String::new()
-    } else {
-        let source_budget = timeout.saturating_sub(started.elapsed().as_secs()).max(5);
-        chaser.source(url, proxy, source_budget).await?
-    };
+    if return_only_cookies {
+        return Ok(FetchResponse {
+            url: url.to_string(),
+            status: DEFAULT_HTTP_STATUS,
+            body: String::new(),
+            cookies: state.cookies.clone(),
+            user_agent: state.user_agent.clone(),
+        });
+    }
 
+    let response = chaser.source(url, proxy).await?;
     Ok(FetchResponse {
         url: url.to_string(),
-        status: DEFAULT_HTTP_STATUS,
-        body,
+        status: response.status.unwrap_or(DEFAULT_HTTP_STATUS),
+        body: response.html,
         cookies: state.cookies.clone(),
         user_agent: state.user_agent.clone(),
     })
@@ -95,7 +87,7 @@ fn needs_refresh(state: &SessionData, cfg: &SessionConfig, host: Option<&str>) -
     age < 0 || age >= cfg.clearance_ttl_seconds
 }
 
-fn apply_waf_session(state: &mut SessionData, session: &WafSession, url: &str) {
+fn apply_waf_session(state: &mut SessionData, session: &WafSummary, url: &str) {
     let fallback_host = Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(String::from));

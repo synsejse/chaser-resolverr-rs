@@ -64,17 +64,18 @@ impl Default for SessionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// Per-session config plus the shared ChaserClient handle.
+#[derive(Clone)]
 pub struct BrowserConfig {
     pub proxy: Option<ProxyConfig>,
     pub chaser: ChaserClient,
     pub session: SessionConfig,
 }
 
-#[derive(Debug, Clone)]
+/// Env-driven server-wide config. `chaser` is constructed separately at
+/// startup because `ChaserCF::new` is async and `load_from_env` isn't.
 pub struct ServerConfig {
     pub proxy: Option<ProxyConfig>,
-    pub chaser: ChaserClient,
     pub session: SessionConfig,
     pub data_path: String,
     pub host: String,
@@ -82,39 +83,28 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn bind_address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
-
-    pub fn to_browser_config(&self) -> BrowserConfig {
-        BrowserConfig {
-            proxy: self.proxy.clone(),
-            chaser: self.chaser.clone(),
-            session: self.session.clone(),
-        }
+    pub fn into_browser_config(self, chaser: ChaserClient) -> (BrowserConfig, RuntimeConfig) {
+        (
+            BrowserConfig {
+                proxy: self.proxy,
+                chaser,
+                session: self.session,
+            },
+            RuntimeConfig {
+                data_path: self.data_path,
+                bind: format!("{}:{}", self.host, self.port),
+            },
+        )
     }
 }
 
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            proxy: None,
-            chaser: ChaserClient::default(),
-            session: SessionConfig::default(),
-            data_path: "/data".to_string(),
-            host: "0.0.0.0".to_string(),
-            port: 8191,
-        }
-    }
+/// What `main.rs` needs after ChaserClient has been initialized.
+pub struct RuntimeConfig {
+    pub data_path: String,
+    pub bind: String,
 }
 
 pub fn load_from_env() -> Result<ServerConfig> {
-    let chaser_url =
-        std::env::var("CHASER_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
-    let chaser_auth = std::env::var("CHASER_AUTH_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty());
-
     let proxy = match (
         std::env::var("PROXY_HOST").ok().filter(|s| !s.is_empty()),
         std::env::var("PROXY_PORT").ok().filter(|s| !s.is_empty()),
@@ -144,7 +134,6 @@ pub fn load_from_env() -> Result<ServerConfig> {
 
     Ok(ServerConfig {
         proxy,
-        chaser: ChaserClient::new(chaser_url, chaser_auth),
         session: SessionConfig {
             clearance_ttl_seconds,
         },

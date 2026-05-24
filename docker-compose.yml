@@ -1,16 +1,8 @@
 services:
-  chaser-cf:
-    image: ghcr.io/synsejse/chaser-cf:main
-    restart: unless-stopped
-    shm_size: 2gb
-
   chaser-resolverr:
     image: ghcr.io/synsejse/chaser-resolverr-rs:main
     restart: unless-stopped
-    depends_on:
-      - chaser-cf
-    environment:
-      - CHASER_URL=http://chaser-cf:3000
+    shm_size: 2gb
     volumes:
       - ./data:/data
     ports:

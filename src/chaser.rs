@@ -1,194 +1,92 @@
-//! chaser-cf HTTP client (`POST /solve`).
-//!
-//! The upstream README documents an enveloped shape
-//! (`{"type":"WafSession","data":{…}}`) but the deployed server actually
-//! returns a flat object — `{"code":200,"cookies":[…],"headers":{…}}` for
-//! `waf-session`, `{"code":200,"source":"<html>"}` for `source`,
-//! `{"code":<non-200>,"message":"…"}` on error. We parse the flat form.
+//! Thin adapter around the vendored `chaser_cf` library — translates our
+//! config + cookie types into chaser-cf's types and back.
 
 use anyhow::{Result, anyhow};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use chaser_cf::{ChaserCF, ChaserConfig, ProxyConfig as CfProxy, SourceResponse, WafSession};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
 
 use crate::config::ProxyConfig;
 
-const SUCCESS_CODE: i64 = 200;
-
-#[derive(Debug, Clone)]
+/// Wraps an `Arc<ChaserCF>` so the browser stays alive across all sessions
+/// and clones are cheap. Initializes lazily on first request.
+#[derive(Clone)]
 pub struct ChaserClient {
-    client: Client,
-    endpoint: String,
-    auth_token: Option<String>,
-}
-
-impl Default for ChaserClient {
-    fn default() -> Self {
-        Self::new("http://127.0.0.1:3000".to_string(), None)
-    }
+    inner: Arc<ChaserCF>,
 }
 
 impl ChaserClient {
-    pub fn new(endpoint: String, auth_token: Option<String>) -> Self {
-        Self {
-            client: Client::new(),
-            endpoint,
-            auth_token,
-        }
-    }
-
-    /// Any HTTP response from the root URL (even 404 / 405) counts as alive
-    /// — chaser-cf doesn't expose a dedicated health endpoint.
-    pub async fn ping(&self, timeout: u64) -> Result<()> {
-        let probe = Client::builder()
-            .timeout(Duration::from_secs(timeout))
-            .build()
-            .map_err(|e| anyhow!("client build failed: {}", e))?;
-        probe
-            .get(self.endpoint.trim_end_matches('/'))
-            .send()
+    pub async fn init() -> Result<Self> {
+        let config = ChaserConfig::from_env();
+        let inner = ChaserCF::new(config)
             .await
-            .map(|_| ())
-            .map_err(|e| anyhow!("connect: {}", e))
-    }
-
-    pub async fn waf_session(
-        &self,
-        url: &str,
-        proxy: Option<&ProxyConfig>,
-        timeout: u64,
-    ) -> Result<WafSession> {
-        let resp: SolveResponse = self.solve("waf-session", url, proxy, None, timeout).await?;
-        if resp.code != SUCCESS_CODE {
-            return Err(anyhow!(
-                "chaser-cf error code={} message={:?}",
-                resp.code,
-                resp.message.unwrap_or_default()
-            ));
-        }
-        Ok(WafSession {
-            cookies: resp.cookies.unwrap_or_default(),
-            headers: resp.headers.unwrap_or_default(),
+            .map_err(|e| anyhow!("chaser-cf init failed: {}", e))?;
+        Ok(Self {
+            inner: Arc::new(inner),
         })
     }
 
-    pub async fn source(
-        &self,
-        url: &str,
-        proxy: Option<&ProxyConfig>,
-        timeout: u64,
-    ) -> Result<String> {
-        let resp: SolveResponse = self.solve("source", url, proxy, None, timeout).await?;
-        if resp.code != SUCCESS_CODE {
-            return Err(anyhow!(
-                "chaser-cf error code={} message={:?}",
-                resp.code,
-                resp.message.unwrap_or_default()
-            ));
-        }
-        resp.source
-            .ok_or_else(|| anyhow!("chaser-cf source response missing `source` field"))
+    pub async fn shutdown(&self) {
+        self.inner.shutdown().await;
     }
 
-    async fn solve(
-        &self,
-        mode: &str,
-        url: &str,
-        proxy: Option<&ProxyConfig>,
-        site_key: Option<&str>,
-        timeout: u64,
-    ) -> Result<SolveResponse> {
-        let req = SolveRequest {
-            mode,
-            url,
-            proxy: proxy.map(ChaserProxy::from),
-            site_key,
-        };
+    pub async fn is_ready(&self) -> bool {
+        self.inner.is_ready().await
+    }
 
-        let mut builder = self
-            .client
-            .post(format!("{}/solve", self.endpoint.trim_end_matches('/')))
-            .json(&req)
-            .timeout(Duration::from_secs(timeout));
-
-        if let Some(token) = &self.auth_token {
-            builder = builder.bearer_auth(token);
-        }
-
-        let resp = builder
-            .send()
+    pub async fn waf_session(&self, url: &str, proxy: Option<&ProxyConfig>) -> Result<WafSummary> {
+        let session: WafSession = self
+            .inner
+            .solve_waf_session(url, proxy.map(CfProxy::from))
             .await
-            .map_err(|e| anyhow!("chaser-cf request failed: {}", e))?;
+            .map_err(|e| anyhow!("waf-session failed: {}", e))?;
+        Ok(WafSummary {
+            cookies: session
+                .cookies
+                .into_iter()
+                .map(|c| WafCookie {
+                    name: c.name,
+                    value: c.value,
+                    domain: c.domain,
+                    path: c.path,
+                    expires: c.expires,
+                    http_only: c.http_only,
+                    secure: c.secure,
+                    same_site: c.same_site,
+                })
+                .collect(),
+            headers: session.headers,
+        })
+    }
 
-        let status = resp.status();
-        let body = resp
-            .text()
+    pub async fn source(&self, url: &str, proxy: Option<&ProxyConfig>) -> Result<SourceResponse> {
+        self.inner
+            .get_source(url, proxy.map(CfProxy::from))
             .await
-            .map_err(|e| anyhow!("chaser-cf body read failed: {}", e))?;
-
-        if !status.is_success() {
-            return Err(anyhow!("chaser-cf returned HTTP {}: {}", status, body));
-        }
-
-        serde_json::from_str(&body)
-            .map_err(|e| anyhow!("Failed to parse chaser-cf response ({}): {}", e, body))
+            .map_err(|e| anyhow!("source failed: {}", e))
     }
 }
 
-#[derive(Debug, Serialize)]
-struct SolveRequest<'a> {
-    mode: &'a str,
-    url: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    proxy: Option<ChaserProxy>,
-    #[serde(rename = "siteKey", skip_serializing_if = "Option::is_none")]
-    site_key: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChaserProxy {
-    host: String,
-    port: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    password: Option<String>,
-}
-
-impl From<&ProxyConfig> for ChaserProxy {
+impl From<&ProxyConfig> for CfProxy {
     fn from(p: &ProxyConfig) -> Self {
-        Self {
-            host: p.host.clone(),
-            port: p.port,
-            username: p.username.clone(),
-            password: p.password.clone(),
+        let mut cfp = CfProxy::new(p.host.clone(), p.port);
+        if let (Some(u), Some(pw)) = (&p.username, &p.password) {
+            cfp = cfp.with_auth(u.clone(), pw.clone());
         }
+        cfp
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SolveResponse {
-    code: i64,
-    #[serde(default)]
-    cookies: Option<Vec<WafCookie>>,
-    #[serde(default)]
-    headers: Option<HashMap<String, String>>,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct WafSession {
+/// Trimmed waf-session payload used by the fetcher (and not exposing the
+/// upstream `Cookie`/`WafSession` types beyond this module).
+pub struct WafSummary {
     pub cookies: Vec<WafCookie>,
     pub headers: HashMap<String, String>,
 }
 
-impl WafSession {
-    /// Case-insensitive lookup — chaser-cf has shipped both `User-Agent`
-    /// and `user-agent` at different points.
+impl WafSummary {
+    /// Case-insensitive lookup — both `User-Agent` and `user-agent` have
+    /// shipped at various points.
     pub fn user_agent(&self) -> Option<&str> {
         self.headers
             .iter()
@@ -197,21 +95,14 @@ impl WafSession {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
 pub struct WafCookie {
     pub name: String,
     pub value: String,
-    #[serde(default)]
     pub domain: Option<String>,
-    #[serde(default)]
     pub path: Option<String>,
     /// Fractional seconds since the Unix epoch.
-    #[serde(default)]
     pub expires: Option<f64>,
-    #[serde(default)]
     pub http_only: Option<bool>,
-    #[serde(default)]
     pub secure: Option<bool>,
-    #[serde(default)]
     pub same_site: Option<String>,
 }

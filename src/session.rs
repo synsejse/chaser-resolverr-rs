@@ -139,19 +139,13 @@ impl Session {
         Ok(())
     }
 
-    pub async fn fetch(
-        &mut self,
-        url: &str,
-        timeout: u64,
-        return_only_cookies: bool,
-    ) -> Result<FetchResponse> {
+    pub async fn fetch(&mut self, url: &str, return_only_cookies: bool) -> Result<FetchResponse> {
         fetcher::fetch(
             &self.chaser,
             self.proxy.as_ref(),
             &self.session_cfg,
             &mut self.data,
             url,
-            timeout,
             return_only_cookies,
         )
         .await

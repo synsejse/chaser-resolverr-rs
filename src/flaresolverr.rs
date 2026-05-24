@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::chaser::ChaserClient;
-use crate::config::ServerConfig;
+use crate::config::BrowserConfig;
 use crate::fetcher::upsert_cookie;
 use crate::logging::LogContext;
 use crate::session::{DEFAULT_SESSION_ID, SessionManager, StoredCookie};
@@ -23,7 +23,6 @@ use crate::session::{DEFAULT_SESSION_ID, SessionManager, StoredCookie};
 const STATUS_OK: &str = "ok";
 const STATUS_ERROR: &str = "error";
 const VERSION: &str = "3.3.21";
-const DEFAULT_TIMEOUT_MS: u32 = 60000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlaresolverrCookie {
@@ -201,10 +200,10 @@ pub struct FlareSolverrAPI {
 }
 
 impl FlareSolverrAPI {
-    pub fn new(config: ServerConfig) -> Self {
-        let data_dir = std::path::Path::new(&config.data_path).join("sessions");
-        let chaser = config.chaser.clone();
-        let sessions = SessionManager::new(config.to_browser_config(), data_dir);
+    pub fn new(browser_cfg: BrowserConfig, data_path: &str) -> Self {
+        let data_dir = std::path::Path::new(data_path).join("sessions");
+        let chaser = browser_cfg.chaser.clone();
+        let sessions = SessionManager::new(browser_cfg, data_dir);
         Self {
             state: AppState { sessions, chaser },
         }
@@ -230,22 +229,21 @@ async fn index() -> ResponseJson<IndexResponse> {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     debug!("Health check");
-    match state.chaser.ping(2).await {
-        Ok(()) => (
+    if state.chaser.is_ready().await {
+        (
             StatusCode::OK,
             ResponseJson(HealthResponse {
                 status: STATUS_OK.to_string(),
             }),
-        ),
-        Err(e) => {
-            warn!("Health check failed: {}", e);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ResponseJson(HealthResponse {
-                    status: format!("chaser-cf unhealthy: {}", e),
-                }),
-            )
-        }
+        )
+    } else {
+        warn!("Health check failed: chaser-cf browser not ready");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ResponseJson(HealthResponse {
+                status: "chaser-cf browser not ready".to_string(),
+            }),
+        )
     }
 }
 
@@ -310,8 +308,12 @@ async fn handle_get(req: V1Request, sm: &SessionManager) -> V1Response {
     if req.session_ttl_minutes.is_some() {
         warn!("'session_ttl_minutes' on request.get is ignored; set it on sessions.create");
     }
+    if req.max_timeout.is_some() {
+        // chaser-cf enforces its own per-call timeout from CHASER_TIMEOUT;
+        // the request-level value isn't plumbed through.
+        debug!("'maxTimeout' is honored by chaser-cf via CHASER_TIMEOUT, not per-request");
+    }
 
-    let timeout = req.max_timeout.unwrap_or(DEFAULT_TIMEOUT_MS) / 1000;
     let session_id = sm.resolve_session_id(req.session.as_deref());
     let is_default = session_id == DEFAULT_SESSION_ID;
 
@@ -347,9 +349,7 @@ async fn handle_get(req: V1Request, sm: &SessionManager) -> V1Response {
     );
 
     let return_only_cookies = req.return_only_cookies.unwrap_or(false);
-    let fetch_result = session
-        .fetch(&url, timeout.into(), return_only_cookies)
-        .await;
+    let fetch_result = session.fetch(&url, return_only_cookies).await;
 
     if let Err(e) = session.save() {
         warn!("[session={}] Failed to save: {}", session_id, e);

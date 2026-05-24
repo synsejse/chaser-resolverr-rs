@@ -8,6 +8,7 @@ mod flaresolverr;
 mod logging;
 mod session;
 
+use chaser::ChaserClient;
 use flaresolverr::FlareSolverrAPI;
 
 #[tokio::main]
@@ -20,9 +21,10 @@ async fn main() -> Result<()> {
 
     let config = config::load_from_env()?;
 
-    let addr = config.bind_address();
-    info!("FlareSolverr API server starting on {}", addr);
-    info!("Session data directory: {}", config.data_path);
+    info!("Initializing chaser-cf browser...");
+    let chaser = ChaserClient::init().await?;
+    info!("chaser-cf browser ready");
+
     match &config.proxy {
         Some(p) => info!(
             "Upstream proxy: {}:{} (auth: {})",
@@ -33,14 +35,20 @@ async fn main() -> Result<()> {
         None => info!("No upstream proxy configured; chaser-cf will egress directly"),
     }
 
-    let api = FlareSolverrAPI::new(config);
+    let (browser_cfg, runtime) = config.into_browser_config(chaser.clone());
+    info!("FlareSolverr API server starting on {}", runtime.bind);
+    info!("Session data directory: {}", runtime.data_path);
+
+    let api = FlareSolverrAPI::new(browser_cfg, &runtime.data_path);
     let app = api.create_router();
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&runtime.bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    info!("Shutting down chaser-cf...");
+    chaser.shutdown().await;
     Ok(())
 }
 
