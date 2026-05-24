@@ -351,14 +351,10 @@ async fn try_click_challenge(chaser: &chaser_oxide::ChaserPage) {
         // P1, P2 are random control points that produce a natural arc.
         let p0x = tx + rng.random_range(-200.0..=-60.0_f64);
         let p0y = ty + rng.random_range(-120.0..=120.0_f64);
-        let p1x =
-            p0x + (tx - p0x) * rng.random_range(0.2..0.5_f64) + rng.random_range(-30.0..30.0);
-        let p1y =
-            p0y + (ty - p0y) * rng.random_range(0.1..0.4_f64) + rng.random_range(-40.0..40.0);
-        let p2x =
-            p0x + (tx - p0x) * rng.random_range(0.5..0.8_f64) + rng.random_range(-20.0..20.0);
-        let p2y =
-            p0y + (ty - p0y) * rng.random_range(0.5..0.9_f64) + rng.random_range(-20.0..20.0);
+        let p1x = p0x + (tx - p0x) * rng.random_range(0.2..0.5_f64) + rng.random_range(-30.0..30.0);
+        let p1y = p0y + (ty - p0y) * rng.random_range(0.1..0.4_f64) + rng.random_range(-40.0..40.0);
+        let p2x = p0x + (tx - p0x) * rng.random_range(0.5..0.8_f64) + rng.random_range(-20.0..20.0);
+        let p2y = p0y + (ty - p0y) * rng.random_range(0.5..0.9_f64) + rng.random_range(-20.0..20.0);
 
         let steps: u8 = rng.random_range(12..22);
         let mut points: Vec<(f64, f64, u64)> = Vec::with_capacity(steps as usize);
