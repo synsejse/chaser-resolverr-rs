@@ -1,0 +1,24 @@
+# Rust build artifacts
+target/
+
+# VCS / scratch
+.git/
+.gitignore
+.github/
+*.rs.bk
+*.swp
+
+# IDE / editor
+.idea/
+.vscode/
+.zed/
+
+# Local data volume — keep cookies out of the build context.
+data/
+
+# Claude Code workspace metadata
+.claude/
+
+# Self
+Dockerfile
+.dockerignore

@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Local persistent data (cookies)
+/data
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# Claude Code workspace metadata
+.claude/

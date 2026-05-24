@@ -1,0 +1,64 @@
+services:
+  # chaser-cf publishes no image. Build one from
+  # https://github.com/0xchasercat/chaser-cf and tag it `chaser-cf:latest`.
+  # Bundle xvfb + set CHASER_VIRTUAL_DISPLAY=true — Cloudflare detects pure
+  # headless Chrome at the binary level.
+  chaser-cf:
+    image: chaser-cf:latest
+    restart: always
+    environment:
+      - PORT=3000
+      - CHASER_VIRTUAL_DISPLAY=true
+      - CHASER_HEADLESS=false
+      - CHASER_CONTEXT_LIMIT=20
+      - CHASER_TIMEOUT=60000
+      - CHASER_EXTRA_ARGS=--no-sandbox
+      # - AUTH_TOKEN=changeme  # if set, also set CHASER_AUTH_TOKEN below
+    # Chrome needs more shm than the 64M default.
+    shm_size: 2gb
+
+  # Optional authenticated upstream proxy. Comment out if you don't need one.
+  proxy:
+    image: yegor256/squid-proxy
+    restart: always
+    ports:
+      - "8081:3128"
+    environment:
+      - USERNAME=username
+      - PASSWORD=password
+
+  chaser-resolverr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - chaser-resolverr:latest
+    depends_on:
+      - chaser-cf
+      - proxy
+    environment:
+      # Required — where to reach chaser-cf
+      - CHASER_URL=http://chaser-cf:3000
+      # - CHASER_AUTH_TOKEN=changeme   # if chaser-cf is started with AUTH_TOKEN
+
+      # Optional — listening interface/port
+      # - HOST=0.0.0.0
+      # - PORT=8191
+
+      # Optional — session storage
+      # - DATA_PATH=/data
+
+      # Optional — how long a cached cf_clearance is considered fresh (s).
+      # cf_clearance is ~30m by default; 25m keeps a safety margin.
+      # - CLEARANCE_TTL_SECONDS=1500
+
+      # Optional upstream proxy passed through to chaser-cf so the headful
+      # browser shares the same egress as the rest of the stack.
+      - PROXY_HOST=proxy
+      - PROXY_PORT=3128
+      - PROXY_USERNAME=username
+      - PROXY_PASSWORD=password
+    volumes:
+      - ./data:/data
+    ports:
+      - "8191:8191"

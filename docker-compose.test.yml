@@ -1,0 +1,31 @@
+# Minimal test stack — assumes both images are already built:
+#   docker build -t chaser-cf:test /tmp/chaser-cf
+#   docker build -t chaser-resolverr-rs:test .
+# Then: docker compose -f docker-compose.test.yml up
+services:
+  chaser-cf:
+    image: chaser-cf:test
+    restart: unless-stopped
+    environment:
+      - PORT=3000
+      - CHASER_HEADLESS=false
+      - CHASER_VIRTUAL_DISPLAY=true
+      - CHASER_EXTRA_ARGS=--no-sandbox
+      - CHASER_CONTEXT_LIMIT=4
+      - CHASER_TIMEOUT=60000
+    shm_size: 2gb
+
+  chaser-resolverr:
+    image: chaser-resolverr-rs:test
+    depends_on:
+      - chaser-cf
+    environment:
+      - CHASER_URL=http://chaser-cf:3000
+      - HOST=0.0.0.0
+      - PORT=8191
+      - DATA_PATH=/data
+      - RUST_LOG=info,chaser_resolverr_rs=debug
+    volumes:
+      - ./data:/data
+    ports:
+      - "8191:8191"
