@@ -1,16 +1,11 @@
 services:
   chaser-cf:
-    build:
-      context: docker
-      dockerfile: chaser-cf.Dockerfile
-    image: chaser-cf:local
+    image: ghcr.io/synsejse/chaser-cf:main
     restart: unless-stopped
     shm_size: 2gb
 
   chaser-resolverr:
-    build:
-      context: .
-    image: chaser-resolverr-rs:local
+    image: ghcr.io/synsejse/chaser-resolverr-rs:main
     restart: unless-stopped
     depends_on:
       - chaser-cf

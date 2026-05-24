@@ -32,16 +32,17 @@ when our cached `cf_clearance` is missing/stale/wrong-host, then one
 ## Quick start
 
 ```sh
-docker compose up --build
+docker compose up -d
 ```
 
-That builds both images (this server + chaser-cf from source, with xvfb
-bundled and the rust toolchain bumped — chaser-cf's upstream Dockerfile
-pins 1.85, which is too old for current deps) and starts them. API is
-then on `http://localhost:8191`.
+Pulls two prebuilt images from ghcr — `ghcr.io/synsejse/chaser-resolverr-rs`
+(this server) and `ghcr.io/synsejse/chaser-cf` (chaser-cf from source,
+with xvfb bundled and the rust toolchain bumped — upstream pins 1.85,
+which is too old for current deps). API is then on `http://localhost:8191`.
 
-Override the chaser-cf git ref with a build arg if you want to pin:
-`docker compose build --build-arg CHASER_CF_REF=<sha|tag|branch>`.
+To build locally from source instead, the Dockerfiles live at
+[Dockerfile](Dockerfile) and [docker/chaser-cf.Dockerfile](docker/chaser-cf.Dockerfile)
+— override `CHASER_CF_REF` to pin a specific upstream commit.
 
 ## Configuration
 
