@@ -30,6 +30,11 @@ pub struct SessionData {
     /// call `waf-session`.
     #[serde(default)]
     pub clearance_fetched_at: Option<i64>,
+    /// Host the cached clearance was solved for. If the next fetch
+    /// targets a different host the cache is invalidated, otherwise a
+    /// site-A clearance would be returned with site-B's body.
+    #[serde(default)]
+    pub clearance_host: Option<String>,
 }
 
 impl Default for SessionData {
@@ -38,6 +43,7 @@ impl Default for SessionData {
             user_agent: ua_generator::ua::spoof_ua().to_string(),
             cookies: Vec::new(),
             clearance_fetched_at: None,
+            clearance_host: None,
         }
     }
 }

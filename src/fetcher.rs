@@ -36,11 +36,16 @@ pub async fn fetch(
     timeout: u64,
     return_only_cookies: bool,
 ) -> Result<FetchResponse> {
-    if needs_refresh(state, cfg) {
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from));
+
+    if needs_refresh(state, cfg, host.as_deref()) {
         debug!("Refreshing chaser-cf waf-session for {}", url);
         let session = chaser.waf_session(url, proxy, timeout).await?;
         apply_waf_session(state, &session, url);
         state.clearance_fetched_at = Some(Utc::now().timestamp());
+        state.clearance_host = host;
     } else {
         debug!("Reusing cached chaser-cf clearance for {}", url);
     }
@@ -60,7 +65,10 @@ pub async fn fetch(
     })
 }
 
-fn needs_refresh(state: &SessionData, cfg: &SessionConfig) -> bool {
+fn needs_refresh(state: &SessionData, cfg: &SessionConfig, host: Option<&str>) -> bool {
+    if state.clearance_host.as_deref() != host {
+        return true;
+    }
     let Some(fetched_at) = state.clearance_fetched_at else {
         return true;
     };
