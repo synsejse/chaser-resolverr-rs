@@ -32,18 +32,16 @@ when our cached `cf_clearance` is missing/stale/wrong-host, then one
 ## Quick start
 
 ```sh
-# 1. Build the chaser-cf image (no public image is published).
-git clone https://github.com/0xchasercat/chaser-cf /tmp/chaser-cf
-docker build -t chaser-cf:latest /tmp/chaser-cf
-# Bundle xvfb yourself if you want Cloudflare's managed challenges to clear —
-# pure headless Chrome is detected at the binary level.
-
-# 2. Build + run this server.
 docker compose up --build
 ```
 
-API is then on `http://localhost:8191`. See [docker-compose.yml](docker-compose.yml)
-for the env-var-driven config.
+That builds both images (this server + chaser-cf from source, with xvfb
+bundled and the rust toolchain bumped — chaser-cf's upstream Dockerfile
+pins 1.85, which is too old for current deps) and starts them. API is
+then on `http://localhost:8191`.
+
+Override the chaser-cf git ref with a build arg if you want to pin:
+`docker compose build --build-arg CHASER_CF_REF=<sha|tag|branch>`.
 
 ## Configuration
 
