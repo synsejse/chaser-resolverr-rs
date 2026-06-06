@@ -35,26 +35,7 @@ pub async fn fetch(
     url: &str,
     return_only_cookies: bool,
 ) -> Result<FetchResponse> {
-    let host = Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(String::from));
-
-    if needs_refresh(state, cfg, host.as_deref()) {
-        debug!("Refreshing chaser-cf waf-session for {}", url);
-        match chaser.waf_session(url, proxy).await {
-            Ok(session) => apply_waf_session(state, &session, url),
-            Err(e) => debug!(
-                "waf-session for {} returned no clearance ({}); proceeding without cookie refresh",
-                url, e
-            ),
-        }
-        // Record the attempt either way so we don't re-hammer waf-session
-        // on every request to a confirmed non-CF host.
-        state.clearance_fetched_at = Some(Utc::now().timestamp());
-        state.clearance_host = host;
-    } else {
-        debug!("Reusing cached chaser-cf clearance for {}", url);
-    }
+    refresh_clearance(chaser, proxy, cfg, state, url).await;
 
     if return_only_cookies {
         return Ok(FetchResponse {
@@ -74,6 +55,61 @@ pub async fn fetch(
         cookies: state.cookies.clone(),
         user_agent: state.user_agent.clone(),
     })
+}
+
+/// POST `post_data` to `url`, sharing the same clearance-refresh path as
+/// [`fetch`]. The body is sent through the browser (see
+/// `chaser_cf::ChaserCF::post_source`) so it survives Cloudflare's
+/// connection-layer fingerprinting.
+pub async fn fetch_post(
+    chaser: &ChaserClient,
+    proxy: Option<&ProxyConfig>,
+    cfg: &SessionConfig,
+    state: &mut SessionData,
+    url: &str,
+    post_data: &str,
+) -> Result<FetchResponse> {
+    refresh_clearance(chaser, proxy, cfg, state, url).await;
+
+    let response = chaser.post(url, post_data, proxy).await?;
+    Ok(FetchResponse {
+        url: url.to_string(),
+        status: response.status.unwrap_or(DEFAULT_HTTP_STATUS),
+        body: response.html,
+        cookies: state.cookies.clone(),
+        user_agent: state.user_agent.clone(),
+    })
+}
+
+/// Refresh `cf_clearance` + UA into `state` when the cache is stale or for a
+/// different host. Failures are non-fatal — a confirmed non-CF host simply
+/// has no clearance to mint, and we still record the attempt so we don't
+/// re-hammer waf-session on every request.
+async fn refresh_clearance(
+    chaser: &ChaserClient,
+    proxy: Option<&ProxyConfig>,
+    cfg: &SessionConfig,
+    state: &mut SessionData,
+    url: &str,
+) {
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from));
+
+    if needs_refresh(state, cfg, host.as_deref()) {
+        debug!("Refreshing chaser-cf waf-session for {}", url);
+        match chaser.waf_session(url, proxy).await {
+            Ok(session) => apply_waf_session(state, &session, url),
+            Err(e) => debug!(
+                "waf-session for {} returned no clearance ({}); proceeding without cookie refresh",
+                url, e
+            ),
+        }
+        state.clearance_fetched_at = Some(Utc::now().timestamp());
+        state.clearance_host = host;
+    } else {
+        debug!("Reusing cached chaser-cf clearance for {}", url);
+    }
 }
 
 fn needs_refresh(state: &SessionData, cfg: &SessionConfig, host: Option<&str>) -> bool {

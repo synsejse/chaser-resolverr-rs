@@ -150,6 +150,18 @@ impl Session {
         )
         .await
     }
+
+    pub async fn fetch_post(&mut self, url: &str, post_data: &str) -> Result<FetchResponse> {
+        fetcher::fetch_post(
+            &self.chaser,
+            self.proxy.as_ref(),
+            &self.session_cfg,
+            &mut self.data,
+            url,
+            post_data,
+        )
+        .await
+    }
 }
 
 fn load_data(path: &Path) -> Result<SessionData> {

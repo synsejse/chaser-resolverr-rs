@@ -148,6 +148,36 @@ impl ChaserCF {
         .map_err(|_| ChaserError::Timeout(self.config.timeout_ms))?
     }
 
+    /// POST form data to a Cloudflare-protected URL and return the response.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - Target URL to POST to
+    /// * `post_data` - `application/x-www-form-urlencoded` request body
+    /// * `proxy` - Optional proxy configuration
+    ///
+    /// # Returns
+    ///
+    /// The response body of the POST after bypassing Cloudflare protection,
+    /// issued via the browser's own `fetch()` so it passes CF's TLS/HTTP
+    /// fingerprinting.
+    pub async fn post_source(
+        &self,
+        url: &str,
+        post_data: &str,
+        proxy: Option<ProxyConfig>,
+    ) -> ChaserResult<SourceResponse> {
+        let browser = self.browser().await?;
+        let manager = browser.as_ref().ok_or(ChaserError::NotInitialized)?;
+
+        tokio::time::timeout(
+            self.config.timeout(),
+            solver::post_source(manager, url, post_data, proxy),
+        )
+        .await
+        .map_err(|_| ChaserError::Timeout(self.config.timeout_ms))?
+    }
+
     /// Create a WAF session with cookies and headers for authenticated requests
     ///
     /// # Arguments

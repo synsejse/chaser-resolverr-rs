@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::chaser::ChaserClient;
@@ -361,7 +361,7 @@ async fn v1_handler(
 
     let mut response = match req.cmd.as_str() {
         "request.get" => handle_get(req, sm, &state.health).await,
-        "request.post" => handle_post(req).await,
+        "request.post" => handle_post(req, sm, &state.health).await,
         "sessions.create" => handle_create(req, sm).await,
         "sessions.list" => handle_list(sm).await,
         "sessions.destroy" => handle_destroy(req, sm).await,
@@ -385,6 +385,12 @@ async fn v1_handler(
     ResponseJson(response)
 }
 
+/// What `run_fetch` should ask the session to do.
+enum FetchOp {
+    Get { return_only_cookies: bool },
+    Post { post_data: String },
+}
+
 async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -> V1Response {
     let url = match req.url {
         Some(ref u) => u.clone(),
@@ -394,22 +400,40 @@ async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -
         return V1Response::error("Cannot use 'postData' with GET request");
     }
 
-    warn_deprecated(&req);
+    warn_ignored_params(&req);
 
-    // The upstream proxy is fixed at startup; per-request overrides are
-    // warn-and-ignored to keep the wire format FlareSolverr-compatible.
-    if req.proxy.is_some() {
-        warn!("Per-request 'proxy' is ignored; upstream proxy is configured globally via env");
-    }
-    if req.session_ttl_minutes.is_some() {
-        warn!("'session_ttl_minutes' on request.get is ignored; set it on sessions.create");
-    }
-    if req.max_timeout.is_some() {
-        // chaser-cf enforces its own per-call timeout from CHASER_TIMEOUT;
-        // the request-level value isn't plumbed through.
-        debug!("'maxTimeout' is honored by chaser-cf via CHASER_TIMEOUT, not per-request");
-    }
+    let op = FetchOp::Get {
+        return_only_cookies: req.return_only_cookies.unwrap_or(false),
+    };
+    run_fetch(&req, sm, health, &url, op).await
+}
 
+async fn handle_post(req: V1Request, sm: &SessionManager, health: &HealthState) -> V1Response {
+    let url = match req.url {
+        Some(ref u) => u.clone(),
+        None => return V1Response::error("Parameter 'url' is mandatory for request.post"),
+    };
+    let post_data = match req.post_data {
+        Some(ref d) => d.clone(),
+        None => return V1Response::error("Parameter 'postData' is mandatory for request.post"),
+    };
+
+    warn_ignored_params(&req);
+
+    let op = FetchOp::Post { post_data };
+    run_fetch(&req, sm, health, &url, op).await
+}
+
+/// Shared GET/POST pipeline: resolve + lock the session, merge any
+/// client-supplied cookies, run the fetch under the request's `maxTimeout`,
+/// persist, and shape the FlareSolverr response.
+async fn run_fetch(
+    req: &V1Request,
+    sm: &SessionManager,
+    health: &HealthState,
+    url: &str,
+    op: FetchOp,
+) -> V1Response {
     let session_id = sm.resolve_session_id(req.session.as_deref());
     let is_default = session_id == DEFAULT_SESSION_ID;
 
@@ -419,7 +443,8 @@ async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -
     };
 
     // Holding this for the full request serializes concurrent calls on
-    // the same session id so cookie/UA state can't be clobbered.
+    // the same session id so cookie/UA state can't be clobbered. The
+    // maxTimeout below also bounds how long the lock is held.
     let mut session = handle.lock().await;
     session.touch();
 
@@ -444,8 +469,15 @@ async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -
         session.data.cookies.len()
     );
 
-    let return_only_cookies = req.return_only_cookies.unwrap_or(false);
-    let fetch_result = session.fetch(&url, return_only_cookies).await;
+    let budget = resolve_max_timeout(req.max_timeout);
+    let fetch_result = match op {
+        FetchOp::Get {
+            return_only_cookies,
+        } => with_timeout(budget, session.fetch(url, return_only_cookies)).await,
+        FetchOp::Post { ref post_data } => {
+            with_timeout(budget, session.fetch_post(url, post_data)).await
+        }
+    };
 
     if let Err(e) = session.save() {
         warn!("[session={}] Failed to save: {}", session_id, e);
@@ -478,15 +510,44 @@ async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -
     }
 }
 
-async fn handle_post(req: V1Request) -> V1Response {
-    if req.post_data.is_none() {
-        return V1Response::error("Parameter 'postData' is mandatory for request.post");
+/// Run `fut` under `budget`, mapping a timeout to a descriptive error so the
+/// `/v1` response reports `status: "error"` instead of blocking indefinitely.
+async fn with_timeout<F>(budget: Duration, fut: F) -> anyhow::Result<crate::fetcher::FetchResponse>
+where
+    F: std::future::Future<Output = anyhow::Result<crate::fetcher::FetchResponse>>,
+{
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "request exceeded maxTimeout of {}ms",
+            budget.as_millis()
+        )),
     }
-    warn_deprecated(&req);
-    V1Response::error(
-        "request.post is not implemented by chaser-resolverr-rs; \
-         configure your indexer to use GET or route POSTs through a different solver",
-    )
+}
+
+/// FlareSolverr's default solve budget when the client omits `maxTimeout`.
+const DEFAULT_MAX_TIMEOUT_MS: u64 = 60_000;
+
+fn resolve_max_timeout(max_timeout: Option<u32>) -> Duration {
+    let ms = max_timeout
+        .map(u64::from)
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
+/// Warn about request params we accept for wire-compat but intentionally
+/// don't honor per-request.
+fn warn_ignored_params(req: &V1Request) {
+    warn_deprecated(req);
+    // The upstream proxy is fixed at startup; per-request overrides are
+    // warn-and-ignored to keep the wire format FlareSolverr-compatible.
+    if req.proxy.is_some() {
+        warn!("Per-request 'proxy' is ignored; upstream proxy is configured globally via env");
+    }
+    if req.session_ttl_minutes.is_some() {
+        warn!("'session_ttl_minutes' on request.get/post is ignored; set it on sessions.create");
+    }
 }
 
 async fn handle_create(req: V1Request, sm: &SessionManager) -> V1Response {
