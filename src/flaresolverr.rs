@@ -11,18 +11,18 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use log::{debug, warn};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 use crate::chaser::ChaserClient;
 use crate::config::BrowserConfig;
 use crate::fetcher::upsert_cookie;
-use crate::logging::LogContext;
 use crate::session::{DEFAULT_SESSION_ID, SessionManager, StoredCookie};
 
 const STATUS_OK: &str = "ok";
@@ -210,14 +210,21 @@ pub struct HealthResponse {
 }
 
 /// Counters + timestamps surfaced by `/health`. `record_*` is called from
-/// `handle_get` on every fetch outcome.
+/// the fetch path on every outcome.
 #[derive(Clone)]
 struct HealthState {
     started_at: Instant,
     fetches_total: Arc<AtomicU64>,
     fetches_failed: Arc<AtomicU64>,
-    last_success_at: Arc<Mutex<Option<DateTime<Utc>>>>,
-    last_failure: Arc<Mutex<Option<FailureRecord>>>,
+    /// Last success/failure timestamps behind a single lock, so `/health`
+    /// reads them in one acquisition instead of juggling two.
+    timestamps: Arc<Mutex<HealthTimestamps>>,
+}
+
+#[derive(Default)]
+struct HealthTimestamps {
+    last_success_at: Option<DateTime<Utc>>,
+    last_failure: Option<FailureRecord>,
 }
 
 struct FailureRecord {
@@ -231,23 +238,24 @@ impl HealthState {
             started_at: Instant::now(),
             fetches_total: Arc::new(AtomicU64::new(0)),
             fetches_failed: Arc::new(AtomicU64::new(0)),
-            last_success_at: Arc::new(Mutex::new(None)),
-            last_failure: Arc::new(Mutex::new(None)),
+            timestamps: Arc::new(Mutex::new(HealthTimestamps::default())),
         }
     }
 
     async fn record_success(&self) {
         self.fetches_total.fetch_add(1, Ordering::Relaxed);
-        *self.last_success_at.lock().await = Some(Utc::now());
+        self.timestamps.lock().await.last_success_at = Some(Utc::now());
+        crate::metrics::record_fetch(true);
     }
 
     async fn record_failure(&self, reason: impl Into<String>) {
         self.fetches_total.fetch_add(1, Ordering::Relaxed);
         self.fetches_failed.fetch_add(1, Ordering::Relaxed);
-        *self.last_failure.lock().await = Some(FailureRecord {
+        self.timestamps.lock().await.last_failure = Some(FailureRecord {
             at: Utc::now(),
             reason: reason.into(),
         });
+        crate::metrics::record_fetch(false);
     }
 }
 
@@ -256,6 +264,7 @@ struct AppState {
     sessions: SessionManager,
     chaser: ChaserClient,
     health: HealthState,
+    prometheus: PrometheusHandle,
 }
 
 pub struct FlareSolverrAPI {
@@ -263,7 +272,7 @@ pub struct FlareSolverrAPI {
 }
 
 impl FlareSolverrAPI {
-    pub fn new(browser_cfg: BrowserConfig, data_path: &str) -> Self {
+    pub fn new(browser_cfg: BrowserConfig, data_path: &str, prometheus: PrometheusHandle) -> Self {
         let data_dir = std::path::Path::new(data_path).join("sessions");
         let chaser = browser_cfg.chaser.clone();
         let sessions = SessionManager::new(browser_cfg, data_dir);
@@ -272,6 +281,7 @@ impl FlareSolverrAPI {
                 sessions,
                 chaser,
                 health: HealthState::new(),
+                prometheus,
             },
         }
     }
@@ -280,9 +290,19 @@ impl FlareSolverrAPI {
         Router::new()
             .route("/", get(index))
             .route("/health", get(health))
+            .route("/metrics", get(metrics_endpoint))
             .route("/v1", post(v1_handler))
             .with_state(self.state.clone())
     }
+}
+
+/// Prometheus text exposition for scraping. Counters mirror `/health`'s
+/// `fetches_total` / `fetches_failed`.
+async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [("content-type", "text/plain; version=0.0.4")],
+        state.prometheus.render(),
+    )
 }
 
 async fn index() -> ResponseJson<IndexResponse> {
@@ -300,17 +320,11 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let chaser_cf_ready = state.chaser.is_ready().await;
     let sessions = state.sessions.list_sessions().await.len();
 
-    let last_success_at = state
-        .health
-        .last_success_at
-        .lock()
-        .await
-        .as_ref()
-        .map(rfc3339);
-    let last_failure_snapshot = state.health.last_failure.lock().await;
-    let last_failure_at = last_failure_snapshot.as_ref().map(|f| rfc3339(&f.at));
-    let last_failure_reason = last_failure_snapshot.as_ref().map(|f| f.reason.clone());
-    drop(last_failure_snapshot);
+    let timestamps = state.health.timestamps.lock().await;
+    let last_success_at = timestamps.last_success_at.as_ref().map(rfc3339);
+    let last_failure_at = timestamps.last_failure.as_ref().map(|f| rfc3339(&f.at));
+    let last_failure_reason = timestamps.last_failure.as_ref().map(|f| f.reason.clone());
+    drop(timestamps);
 
     let (http_status, status_text) = if chaser_cf_ready {
         (StatusCode::OK, STATUS_OK.to_string())
@@ -349,19 +363,18 @@ async fn v1_handler(
 ) -> ResponseJson<V1Response> {
     let sm = &state.sessions;
     let start = now_ms();
-    let mut ctx = LogContext::new()
-        .with_operation(&req.cmd)
-        .with_session(req.session.as_deref().unwrap_or("default"));
 
-    if let Some(ref url) = req.url {
-        ctx = ctx.with_url(url);
-    }
+    // Capture identifying fields before `req` is moved into a handler, so the
+    // completion event can carry the same structured context as the start.
+    let cmd = req.cmd.clone();
+    let session = req.session.clone().unwrap_or_else(|| "default".to_string());
+    let url = req.url.clone().unwrap_or_default();
 
-    ctx.info("Incoming request");
+    info!(cmd = %cmd, session = %session, url = %url, "Incoming request");
 
     let mut response = match req.cmd.as_str() {
         "request.get" => handle_get(req, sm, &state.health).await,
-        "request.post" => handle_post(req).await,
+        "request.post" => handle_post(req, sm, &state.health).await,
         "sessions.create" => handle_create(req, sm).await,
         "sessions.list" => handle_list(sm).await,
         "sessions.destroy" => handle_destroy(req, sm).await,
@@ -374,15 +387,24 @@ async fn v1_handler(
 
     let duration = (response.end_timestamp - start) as f64 / 1000.0;
     if response.status == STATUS_OK {
-        ctx.info(&format!("Completed in {:.2}s", duration));
+        info!(cmd = %cmd, session = %session, elapsed_secs = duration, "Completed");
     } else {
-        ctx.error(&format!(
-            "Failed after {:.2}s: {}",
-            duration, response.message
-        ));
+        error!(
+            cmd = %cmd,
+            session = %session,
+            elapsed_secs = duration,
+            reason = %response.message,
+            "Request failed"
+        );
     }
 
     ResponseJson(response)
+}
+
+/// What `run_fetch` should ask the session to do.
+enum FetchOp {
+    Get { return_only_cookies: bool },
+    Post { post_data: String },
 }
 
 async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -> V1Response {
@@ -394,22 +416,40 @@ async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -
         return V1Response::error("Cannot use 'postData' with GET request");
     }
 
-    warn_deprecated(&req);
+    warn_ignored_params(&req);
 
-    // The upstream proxy is fixed at startup; per-request overrides are
-    // warn-and-ignored to keep the wire format FlareSolverr-compatible.
-    if req.proxy.is_some() {
-        warn!("Per-request 'proxy' is ignored; upstream proxy is configured globally via env");
-    }
-    if req.session_ttl_minutes.is_some() {
-        warn!("'session_ttl_minutes' on request.get is ignored; set it on sessions.create");
-    }
-    if req.max_timeout.is_some() {
-        // chaser-cf enforces its own per-call timeout from CHASER_TIMEOUT;
-        // the request-level value isn't plumbed through.
-        debug!("'maxTimeout' is honored by chaser-cf via CHASER_TIMEOUT, not per-request");
-    }
+    let op = FetchOp::Get {
+        return_only_cookies: req.return_only_cookies.unwrap_or(false),
+    };
+    run_fetch(&req, sm, health, &url, op).await
+}
 
+async fn handle_post(req: V1Request, sm: &SessionManager, health: &HealthState) -> V1Response {
+    let url = match req.url {
+        Some(ref u) => u.clone(),
+        None => return V1Response::error("Parameter 'url' is mandatory for request.post"),
+    };
+    let post_data = match req.post_data {
+        Some(ref d) => d.clone(),
+        None => return V1Response::error("Parameter 'postData' is mandatory for request.post"),
+    };
+
+    warn_ignored_params(&req);
+
+    let op = FetchOp::Post { post_data };
+    run_fetch(&req, sm, health, &url, op).await
+}
+
+/// Shared GET/POST pipeline: resolve + lock the session, merge any
+/// client-supplied cookies, run the fetch under the request's `maxTimeout`,
+/// persist, and shape the FlareSolverr response.
+async fn run_fetch(
+    req: &V1Request,
+    sm: &SessionManager,
+    health: &HealthState,
+    url: &str,
+    op: FetchOp,
+) -> V1Response {
     let session_id = sm.resolve_session_id(req.session.as_deref());
     let is_default = session_id == DEFAULT_SESSION_ID;
 
@@ -419,7 +459,8 @@ async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -
     };
 
     // Holding this for the full request serializes concurrent calls on
-    // the same session id so cookie/UA state can't be clobbered.
+    // the same session id so cookie/UA state can't be clobbered. The
+    // maxTimeout below also bounds how long the lock is held.
     let mut session = handle.lock().await;
     session.touch();
 
@@ -444,8 +485,15 @@ async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -
         session.data.cookies.len()
     );
 
-    let return_only_cookies = req.return_only_cookies.unwrap_or(false);
-    let fetch_result = session.fetch(&url, return_only_cookies).await;
+    let budget = resolve_max_timeout(req.max_timeout);
+    let fetch_result = match op {
+        FetchOp::Get {
+            return_only_cookies,
+        } => with_timeout(budget, session.fetch(url, return_only_cookies)).await,
+        FetchOp::Post { ref post_data } => {
+            with_timeout(budget, session.fetch_post(url, post_data)).await
+        }
+    };
 
     if let Err(e) = session.save() {
         warn!("[session={}] Failed to save: {}", session_id, e);
@@ -478,15 +526,44 @@ async fn handle_get(req: V1Request, sm: &SessionManager, health: &HealthState) -
     }
 }
 
-async fn handle_post(req: V1Request) -> V1Response {
-    if req.post_data.is_none() {
-        return V1Response::error("Parameter 'postData' is mandatory for request.post");
+/// Run `fut` under `budget`, mapping a timeout to a descriptive error so the
+/// `/v1` response reports `status: "error"` instead of blocking indefinitely.
+async fn with_timeout<F>(budget: Duration, fut: F) -> anyhow::Result<crate::fetcher::FetchResponse>
+where
+    F: std::future::Future<Output = anyhow::Result<crate::fetcher::FetchResponse>>,
+{
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "request exceeded maxTimeout of {}ms",
+            budget.as_millis()
+        )),
     }
-    warn_deprecated(&req);
-    V1Response::error(
-        "request.post is not implemented by chaser-resolverr-rs; \
-         configure your indexer to use GET or route POSTs through a different solver",
-    )
+}
+
+/// FlareSolverr's default solve budget when the client omits `maxTimeout`.
+const DEFAULT_MAX_TIMEOUT_MS: u64 = 60_000;
+
+fn resolve_max_timeout(max_timeout: Option<u32>) -> Duration {
+    let ms = max_timeout
+        .map(u64::from)
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
+/// Warn about request params we accept for wire-compat but intentionally
+/// don't honor per-request.
+fn warn_ignored_params(req: &V1Request) {
+    warn_deprecated(req);
+    // The upstream proxy is fixed at startup; per-request overrides are
+    // warn-and-ignored to keep the wire format FlareSolverr-compatible.
+    if req.proxy.is_some() {
+        warn!("Per-request 'proxy' is ignored; upstream proxy is configured globally via env");
+    }
+    if req.session_ttl_minutes.is_some() {
+        warn!("'session_ttl_minutes' on request.get/post is ignored; set it on sessions.create");
+    }
 }
 
 async fn handle_create(req: V1Request, sm: &SessionManager) -> V1Response {
@@ -534,4 +611,61 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_timeout_defaults_when_absent_or_zero() {
+        let default = Duration::from_millis(DEFAULT_MAX_TIMEOUT_MS);
+        assert_eq!(resolve_max_timeout(None), default);
+        assert_eq!(resolve_max_timeout(Some(0)), default);
+    }
+
+    #[test]
+    fn max_timeout_honors_explicit_value() {
+        assert_eq!(resolve_max_timeout(Some(5000)), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn cookie_roundtrip_session_cookie() {
+        let stored = StoredCookie {
+            name: "cf_clearance".into(),
+            value: "abc".into(),
+            domain: Some("x.com".into()),
+            path: Some("/".into()),
+            expires: None,
+            http_only: true,
+            secure: true,
+            same_site: Some("Lax".into()),
+        };
+        let fs = FlaresolverrCookie::from(stored.clone());
+        // FlareSolverr encodes a session cookie as expires = -1.0.
+        assert_eq!(fs.expires, -1.0);
+
+        let back = StoredCookie::from(fs);
+        assert_eq!(back.expires, None);
+        assert!(back.http_only);
+        assert!(back.secure);
+        assert_eq!(back.same_site.as_deref(), Some("Lax"));
+    }
+
+    #[test]
+    fn cookie_roundtrip_with_expiry() {
+        let stored = StoredCookie {
+            name: "a".into(),
+            value: "b".into(),
+            domain: None,
+            path: None,
+            expires: Some(1_700_000_000),
+            http_only: false,
+            secure: false,
+            same_site: None,
+        };
+        let fs = FlaresolverrCookie::from(stored);
+        assert_eq!(fs.expires, 1_700_000_000.0);
+        assert_eq!(StoredCookie::from(fs).expires, Some(1_700_000_000));
+    }
 }

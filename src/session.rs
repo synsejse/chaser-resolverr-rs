@@ -7,12 +7,12 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::chaser::ChaserClient;
@@ -147,6 +147,18 @@ impl Session {
             &mut self.data,
             url,
             return_only_cookies,
+        )
+        .await
+    }
+
+    pub async fn fetch_post(&mut self, url: &str, post_data: &str) -> Result<FetchResponse> {
+        fetcher::fetch_post(
+            &self.chaser,
+            self.proxy.as_ref(),
+            &self.session_cfg,
+            &mut self.data,
+            url,
+            post_data,
         )
         .await
     }

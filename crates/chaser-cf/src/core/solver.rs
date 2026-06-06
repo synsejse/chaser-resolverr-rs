@@ -15,7 +15,20 @@ const FAKE_PAGE_HTML: &str = include_str!("../resources/fake_page.html");
 /// or `responseStatus` is unavailable (e.g. file:// or about:blank).
 const NAVIGATION_STATUS_JS: &str = "(()=>{const n=performance.getEntriesByType('navigation')[0];return n&&typeof n.responseStatus==='number'?n.responseStatus:null;})()";
 
+/// How long `get_source` waits for a Cloudflare challenge to clear before
+/// giving up and reporting failure.
+const GET_SOURCE_CLEARANCE_TIMEOUT_SECS: u64 = 30;
+/// `solve_waf_session` allows longer — interactive Turnstile can take a
+/// while, and this call exists purely to mint a fresh `cf_clearance`.
+const WAF_SESSION_CLEARANCE_TIMEOUT_SECS: u64 = 90;
+
 /// Get the rendered HTML for `url` plus the HTTP status of the navigation.
+///
+/// Returns `CaptchaFailed` if the navigation lands on a Cloudflare challenge
+/// that is still unsolved when the clearance timeout expires — otherwise the
+/// caller would receive the "Just a moment…" interstitial HTML reported as a
+/// success, and downstream indexers would parse the challenge page as if it
+/// were the real content.
 pub async fn get_source(
     manager: &BrowserManager,
     url: &str,
@@ -32,7 +45,7 @@ pub async fn get_source(
         .await
         .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
 
-    wait_for_clearance(&page, &chaser, 30).await;
+    let outcome = wait_for_clearance(&page, &chaser, GET_SOURCE_CLEARANCE_TIMEOUT_SECS).await;
 
     let html = page
         .content()
@@ -46,7 +59,113 @@ pub async fn get_source(
         .and_then(|v| v?.as_u64())
         .and_then(|n| u16::try_from(n).ok());
 
+    match outcome {
+        ClearanceOutcome::TimedOut => {
+            return Err(ChaserError::CaptchaFailed(format!(
+                "Cloudflare challenge still unsolved after {GET_SOURCE_CLEARANCE_TIMEOUT_SECS}s (navigation status {})",
+                status.map_or_else(|| "unknown".to_string(), |s| s.to_string())
+            )));
+        }
+        ClearanceOutcome::Blocked => {
+            return Err(ChaserError::CaptchaFailed(format!(
+                "Cloudflare returned a terminal block page for {url} (navigation status {})",
+                status.map_or_else(|| "unknown".to_string(), |s| s.to_string())
+            )));
+        }
+        ClearanceOutcome::Cleared | ClearanceOutcome::NotChallenged => {}
+    }
+
     Ok(SourceResponse { html, status })
+}
+
+/// POST `post_data` (`application/x-www-form-urlencoded`) to `url` from inside
+/// the browser, after solving any Cloudflare challenge on that origin.
+///
+/// The request is issued with the page's own `fetch()` in a stealth isolated
+/// world, so it rides Chrome's TLS/HTTP fingerprint and the freshly-minted
+/// `cf_clearance` cookie. A plain reqwest POST with a borrowed clearance is
+/// refused by Cloudflare's connection-layer fingerprinting, which is why we
+/// go through the browser rather than an out-of-process HTTP client.
+pub async fn post_source(
+    manager: &BrowserManager,
+    url: &str,
+    post_data: &str,
+    proxy: Option<ProxyConfig>,
+) -> ChaserResult<SourceResponse> {
+    let _permit = manager.acquire_permit().await?;
+    let ctx_id = manager.create_context(proxy.as_ref()).await?;
+    let (page, chaser) = manager.new_page(ctx_id, "about:blank").await?;
+
+    setup_proxy_auth(&page, proxy.as_ref()).await?;
+
+    // A GET to the target both solves the challenge and makes the subsequent
+    // fetch() same-origin, so cf_clearance + cookies are sent automatically.
+    chaser
+        .goto(url)
+        .await
+        .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
+
+    match wait_for_clearance(&page, &chaser, GET_SOURCE_CLEARANCE_TIMEOUT_SECS).await {
+        ClearanceOutcome::TimedOut => {
+            return Err(ChaserError::CaptchaFailed(format!(
+                "Cloudflare challenge still unsolved after {GET_SOURCE_CLEARANCE_TIMEOUT_SECS}s before POST to {url}"
+            )));
+        }
+        ClearanceOutcome::Blocked => {
+            return Err(ChaserError::CaptchaFailed(format!(
+                "Cloudflare returned a terminal block page before POST to {url}"
+            )));
+        }
+        ClearanceOutcome::Cleared | ClearanceOutcome::NotChallenged => {}
+    }
+
+    // serde_json::to_string never fails for &str, but fall back defensively
+    // rather than unwrap so a malformed input can't panic the worker.
+    let url_lit = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string());
+    let body_lit = serde_json::to_string(post_data).unwrap_or_else(|_| "\"\"".to_string());
+
+    let script = format!(
+        r#"(async () => {{
+            try {{
+                const r = await fetch({url_lit}, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                    body: {body_lit},
+                    credentials: 'include',
+                    redirect: 'follow',
+                }});
+                const text = await r.text();
+                return {{ ok: true, status: r.status, body: text }};
+            }} catch (e) {{
+                return {{ ok: false, status: 0, body: String(e) }};
+            }}
+        }})()"#
+    );
+
+    let value = chaser
+        .evaluate(&script)
+        .await
+        .map_err(|e| ChaserError::Internal(format!("POST fetch eval: {e}")))?
+        .ok_or_else(|| ChaserError::NavigationFailed("POST fetch returned no result".into()))?;
+
+    let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let body = value
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u16::try_from(n).ok());
+
+    if !ok {
+        return Err(ChaserError::NavigationFailed(format!(
+            "POST to {url} failed: {body}"
+        )));
+    }
+
+    Ok(SourceResponse { html: body, status })
 }
 
 /// Navigate to a Cloudflare-protected URL with a stealth browser, solve any interactive
@@ -68,7 +187,19 @@ pub async fn solve_waf_session(
         .await
         .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
 
-    wait_for_clearance(&page, &chaser, 90).await;
+    // Best-effort: even when we don't clear, we return whatever cookies we
+    // have so the caller can still proceed (it tolerates a missing
+    // cf_clearance). get_source/post_source are the authoritative gates that
+    // fail the request when the challenge is genuinely unsolved.
+    match wait_for_clearance(&page, &chaser, WAF_SESSION_CLEARANCE_TIMEOUT_SECS).await {
+        ClearanceOutcome::TimedOut => tracing::warn!(
+            "waf-session for {url} timed out after {WAF_SESSION_CLEARANCE_TIMEOUT_SECS}s with the Cloudflare challenge still present; returning best-effort cookies"
+        ),
+        ClearanceOutcome::Blocked => tracing::warn!(
+            "waf-session for {url} hit a terminal Cloudflare block page; returning best-effort cookies"
+        ),
+        ClearanceOutcome::Cleared | ClearanceOutcome::NotChallenged => {}
+    }
 
     let raw_cookies = page
         .get_cookies()
@@ -210,6 +341,24 @@ async fn setup_proxy_auth(
     Ok(())
 }
 
+/// Outcome of [`wait_for_clearance`], so callers can tell a solved/non-CF
+/// page apart from a challenge we never got through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearanceOutcome {
+    /// `cf_clearance` appeared — the challenge was solved.
+    Cleared,
+    /// The page was never (or is no longer) a Cloudflare challenge, so there
+    /// is nothing to solve and the current HTML is the real content.
+    NotChallenged,
+    /// The timeout expired with an interactive Cloudflare challenge still on
+    /// screen and no clearance cookie — the challenge was not solved.
+    TimedOut,
+    /// A terminal Cloudflare block page (e.g. error 1020 "access denied",
+    /// 1015 rate-limited, "Sorry, you have been blocked"). These never clear
+    /// by waiting, so we fail fast instead of burning the whole timeout.
+    Blocked,
+}
+
 /// Poll until `cf_clearance` appears (meaning the challenge was solved) or the
 /// timeout expires.
 ///
@@ -222,7 +371,7 @@ async fn wait_for_clearance(
     page: &chaser_oxide::Page,
     chaser: &chaser_oxide::ChaserPage,
     timeout_seconds: u64,
-) {
+) -> ClearanceOutcome {
     const PASSIVE_WAIT_MS: u64 = 6_000;
     const CLICK_INTERVAL_MS: u64 = 1_200;
 
@@ -233,19 +382,30 @@ async fn wait_for_clearance(
     loop {
         if has_clearance_cookie(page).await {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            return;
+            return ClearanceOutcome::Cleared;
         }
 
         if started.elapsed() >= timeout {
-            return;
+            // Distinguish a genuine unsolved challenge from a non-CF page we
+            // happened to time out on: only the former is a failure.
+            return if is_cloudflare_interactive_challenge(page).await {
+                ClearanceOutcome::TimedOut
+            } else {
+                ClearanceOutcome::NotChallenged
+            };
         }
 
-        // After the passive window: if neither a clearance cookie nor a
-        // visible CF challenge is present, the site simply isn't CF-protected
-        // and there is nothing for us to wait on.
+        // After the passive window: classify the page so we know whether to
+        // keep solving, fail fast, or stop because it isn't CF at all.
         if started.elapsed().as_millis() as u64 >= PASSIVE_WAIT_MS {
-            if !is_cloudflare_challenge_page(page).await {
-                return;
+            // A terminal block won't resolve no matter how long we wait.
+            if is_cloudflare_block_page(page).await {
+                return ClearanceOutcome::Blocked;
+            }
+            // Neither clearance cookie nor an interactive challenge: the site
+            // simply isn't CF-protected and there is nothing to wait on.
+            if !is_cloudflare_interactive_challenge(page).await {
+                return ClearanceOutcome::NotChallenged;
             }
             if last_click.elapsed().as_millis() as u64 >= CLICK_INTERVAL_MS {
                 try_click_challenge(chaser).await;
@@ -265,23 +425,43 @@ async fn has_clearance_cookie(page: &chaser_oxide::Page) -> bool {
         .unwrap_or(false)
 }
 
-/// Heuristic check: is the current page a Cloudflare challenge?
+/// Heuristic check: is the current page an *interactive* Cloudflare challenge
+/// — one we can plausibly solve by waiting and/or clicking the widget?
 ///
-/// We probe two markers in parallel: the title (CF's "Just a moment…" /
-/// "Attention Required! | Cloudflare" page chrome) and the DOM (challenge
-/// form, error code, or embedded `challenges.cloudflare.com` iframe).
-/// Either signal is enough — we want false only for genuinely non-CF
-/// pages so the caller can stop waiting.
-async fn is_cloudflare_challenge_page(page: &chaser_oxide::Page) -> bool {
+/// We probe the title (CF's "Just a moment…" interstitial chrome) and the DOM
+/// (challenge form, the `cf-challenge-running` marker, or an embedded
+/// `challenges.cloudflare.com` iframe). Either signal is enough.
+async fn is_cloudflare_interactive_challenge(page: &chaser_oxide::Page) -> bool {
     if let Ok(Some(title)) = page.get_title().await {
-        if title.contains("Just a moment")
-            || title.contains("Attention Required")
-            || title.contains("Please Wait")
-        {
+        if title.contains("Just a moment") || title.contains("Please Wait") {
             return true;
         }
     }
-    const PROBE: &str = "!!document.querySelector('#challenge-form,#cf-challenge-running,.cf-error-code,iframe[src*=\"challenges.cloudflare.com\"]')";
+    const PROBE: &str = "!!document.querySelector('#challenge-form,#cf-challenge-running,iframe[src*=\"challenges.cloudflare.com\"]')";
+    matches!(
+        page.evaluate(PROBE)
+            .await
+            .ok()
+            .and_then(|v| v.into_value::<bool>().ok()),
+        Some(true)
+    )
+}
+
+/// Heuristic check: is the current page a *terminal* Cloudflare block — an
+/// error page (1006/1007/1008 banned IP, 1015 rate-limited, 1020 access
+/// denied, "Sorry, you have been blocked") that will never clear by waiting?
+///
+/// These carry a `.cf-error-code`/`.cf-error-details` block or the
+/// "Attention Required! | Cloudflare" title, and crucially do *not* offer a
+/// solvable challenge — so the caller should fail fast rather than spin.
+async fn is_cloudflare_block_page(page: &chaser_oxide::Page) -> bool {
+    if let Ok(Some(title)) = page.get_title().await {
+        if title.contains("Attention Required") {
+            return true;
+        }
+    }
+    const PROBE: &str =
+        "!!document.querySelector('.cf-error-code,.cf-error-details,#cf-error-details')";
     matches!(
         page.evaluate(PROBE)
             .await

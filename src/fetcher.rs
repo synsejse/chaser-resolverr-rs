@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use log::debug;
+use tracing::debug;
 use url::Url;
 
 use crate::chaser::{ChaserClient, WafSummary};
@@ -23,8 +23,12 @@ pub struct FetchResponse {
     pub user_agent: String,
 }
 
-/// Fallback when Chrome's Performance API doesn't surface a navigation
-/// status (older Chrome, some cross-origin redirects).
+/// Display fallback when Chrome's Performance API doesn't surface a
+/// navigation status (older Chrome, some cross-origin redirects). This is a
+/// presentation default only — it does NOT assert success. The
+/// challenge-solved / challenge-failed decision is made upstream in
+/// chaser-cf (`get_source` returns an error when the challenge is unsolved),
+/// so a fabricated 200 here can never mask an unsolved challenge.
 const DEFAULT_HTTP_STATUS: u16 = 200;
 
 pub async fn fetch(
@@ -35,26 +39,7 @@ pub async fn fetch(
     url: &str,
     return_only_cookies: bool,
 ) -> Result<FetchResponse> {
-    let host = Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(String::from));
-
-    if needs_refresh(state, cfg, host.as_deref()) {
-        debug!("Refreshing chaser-cf waf-session for {}", url);
-        match chaser.waf_session(url, proxy).await {
-            Ok(session) => apply_waf_session(state, &session, url),
-            Err(e) => debug!(
-                "waf-session for {} returned no clearance ({}); proceeding without cookie refresh",
-                url, e
-            ),
-        }
-        // Record the attempt either way so we don't re-hammer waf-session
-        // on every request to a confirmed non-CF host.
-        state.clearance_fetched_at = Some(Utc::now().timestamp());
-        state.clearance_host = host;
-    } else {
-        debug!("Reusing cached chaser-cf clearance for {}", url);
-    }
+    refresh_clearance(chaser, proxy, cfg, state, url).await;
 
     if return_only_cookies {
         return Ok(FetchResponse {
@@ -74,6 +59,61 @@ pub async fn fetch(
         cookies: state.cookies.clone(),
         user_agent: state.user_agent.clone(),
     })
+}
+
+/// POST `post_data` to `url`, sharing the same clearance-refresh path as
+/// [`fetch`]. The body is sent through the browser (see
+/// `chaser_cf::ChaserCF::post_source`) so it survives Cloudflare's
+/// connection-layer fingerprinting.
+pub async fn fetch_post(
+    chaser: &ChaserClient,
+    proxy: Option<&ProxyConfig>,
+    cfg: &SessionConfig,
+    state: &mut SessionData,
+    url: &str,
+    post_data: &str,
+) -> Result<FetchResponse> {
+    refresh_clearance(chaser, proxy, cfg, state, url).await;
+
+    let response = chaser.post(url, post_data, proxy).await?;
+    Ok(FetchResponse {
+        url: url.to_string(),
+        status: response.status.unwrap_or(DEFAULT_HTTP_STATUS),
+        body: response.html,
+        cookies: state.cookies.clone(),
+        user_agent: state.user_agent.clone(),
+    })
+}
+
+/// Refresh `cf_clearance` + UA into `state` when the cache is stale or for a
+/// different host. Failures are non-fatal — a confirmed non-CF host simply
+/// has no clearance to mint, and we still record the attempt so we don't
+/// re-hammer waf-session on every request.
+async fn refresh_clearance(
+    chaser: &ChaserClient,
+    proxy: Option<&ProxyConfig>,
+    cfg: &SessionConfig,
+    state: &mut SessionData,
+    url: &str,
+) {
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from));
+
+    if needs_refresh(state, cfg, host.as_deref()) {
+        debug!("Refreshing chaser-cf waf-session for {}", url);
+        match chaser.waf_session(url, proxy).await {
+            Ok(session) => apply_waf_session(state, &session, url),
+            Err(e) => debug!(
+                "waf-session for {} returned no clearance ({}); proceeding without cookie refresh",
+                url, e
+            ),
+        }
+        state.clearance_fetched_at = Some(Utc::now().timestamp());
+        state.clearance_host = host;
+    } else {
+        debug!("Reusing cached chaser-cf clearance for {}", url);
+    }
 }
 
 fn needs_refresh(state: &SessionData, cfg: &SessionConfig, host: Option<&str>) -> bool {
@@ -128,4 +168,95 @@ pub fn upsert_cookie(cookies: &mut Vec<StoredCookie>, incoming: StoredCookie) {
 pub fn purge_expired(cookies: &mut Vec<StoredCookie>) {
     let now = Utc::now().timestamp();
     cookies.retain(|c| c.expires.is_none_or(|e| e > now));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SessionConfig;
+
+    fn cookie(name: &str, domain: &str, path: &str, value: &str) -> StoredCookie {
+        StoredCookie {
+            name: name.into(),
+            value: value.into(),
+            domain: Some(domain.into()),
+            path: Some(path.into()),
+            expires: None,
+            http_only: false,
+            secure: false,
+            same_site: None,
+        }
+    }
+
+    #[test]
+    fn upsert_replaces_same_identity() {
+        let mut cookies = vec![cookie("cf_clearance", "example.com", "/", "old")];
+        upsert_cookie(
+            &mut cookies,
+            cookie("cf_clearance", "example.com", "/", "new"),
+        );
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].value, "new");
+    }
+
+    #[test]
+    fn upsert_keeps_distinct_domains_and_paths() {
+        let mut cookies = vec![cookie("id", "a.com", "/", "1")];
+        upsert_cookie(&mut cookies, cookie("id", "b.com", "/", "2"));
+        upsert_cookie(&mut cookies, cookie("id", "a.com", "/sub", "3"));
+        assert_eq!(cookies.len(), 3);
+    }
+
+    #[test]
+    fn purge_drops_expired_keeps_session_and_future() {
+        let now = Utc::now().timestamp();
+        let mut expired = cookie("a", "x.com", "/", "1");
+        expired.expires = Some(now - 10);
+        let mut future = cookie("b", "x.com", "/", "2");
+        future.expires = Some(now + 10_000);
+        let session = cookie("c", "x.com", "/", "3"); // expires None
+
+        let mut cookies = vec![expired, future, session];
+        purge_expired(&mut cookies);
+
+        let names: Vec<_> = cookies.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c"]);
+    }
+
+    fn fresh_state(host: &str) -> SessionData {
+        SessionData {
+            clearance_fetched_at: Some(Utc::now().timestamp()),
+            clearance_host: Some(host.into()),
+            ..SessionData::default()
+        }
+    }
+
+    #[test]
+    fn needs_refresh_on_host_change_only() {
+        let cfg = SessionConfig {
+            clearance_ttl_seconds: 1500,
+        };
+        let state = fresh_state("a.com");
+        assert!(needs_refresh(&state, &cfg, Some("b.com")));
+        assert!(!needs_refresh(&state, &cfg, Some("a.com")));
+    }
+
+    #[test]
+    fn needs_refresh_when_never_fetched() {
+        let cfg = SessionConfig {
+            clearance_ttl_seconds: 1500,
+        };
+        let state = SessionData::default();
+        assert!(needs_refresh(&state, &cfg, Some("a.com")));
+    }
+
+    #[test]
+    fn needs_refresh_when_ttl_elapsed() {
+        let cfg = SessionConfig {
+            clearance_ttl_seconds: 1500,
+        };
+        let mut state = fresh_state("a.com");
+        state.clearance_fetched_at = Some(Utc::now().timestamp() - 2000);
+        assert!(needs_refresh(&state, &cfg, Some("a.com")));
+    }
 }

@@ -1,11 +1,11 @@
-use anyhow::Result;
-use log::{error, info};
+use anyhow::{Context, Result};
+use tracing::{error, info};
 
 mod chaser;
 mod config;
 mod fetcher;
 mod flaresolverr;
-mod logging;
+mod metrics;
 mod session;
 
 use chaser::ChaserClient;
@@ -13,11 +13,9 @@ use flaresolverr::FlareSolverrAPI;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_default_env()
-        .format_timestamp_secs()
-        .format_module_path(false)
-        .format_target(false)
-        .init();
+    init_tracing();
+
+    let prometheus = metrics::install_recorder().context("install Prometheus recorder")?;
 
     let config = config::load_from_env()?;
 
@@ -39,7 +37,7 @@ async fn main() -> Result<()> {
     info!("FlareSolverr API server starting on {}", runtime.bind);
     info!("Session data directory: {}", runtime.data_path);
 
-    let api = FlareSolverrAPI::new(browser_cfg, &runtime.data_path);
+    let api = FlareSolverrAPI::new(browser_cfg, &runtime.data_path, prometheus);
     let app = api.create_router();
 
     let listener = tokio::net::TcpListener::bind(&runtime.bind).await?;
@@ -50,6 +48,18 @@ async fn main() -> Result<()> {
     info!("Shutting down chaser-cf...");
     chaser.shutdown().await;
     Ok(())
+}
+
+/// Initialize the tracing subscriber. Honors `RUST_LOG` (e.g.
+/// `RUST_LOG=debug` or `chaser_resolverr_rs=debug,chaser_cf=info`); defaults
+/// to `info`. Captures both this crate's events and the vendored chaser-cf's
+/// `tracing` output through a single subscriber.
+fn init_tracing() {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    fmt().with_env_filter(filter).with_target(false).init();
 }
 
 async fn shutdown_signal() {

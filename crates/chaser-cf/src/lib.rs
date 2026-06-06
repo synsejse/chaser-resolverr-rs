@@ -2,7 +2,9 @@
 //!
 //! Two local patches vs upstream:
 //!   * `wait_for_clearance` bails out early when the page is not a CF
-//!     challenge (saves ~24s on non-CF URLs like Prowlarr's `/v1/ping`).
+//!     challenge (saves ~24s on non-CF URLs like Prowlarr's `/v1/ping`),
+//!     and reports its outcome so `get_source` can fail a still-unsolved
+//!     challenge instead of returning the interstitial HTML as success.
 //!   * `get_source` returns the navigation HTTP status alongside the HTML
 //!     so callers can stop faking 200.
 

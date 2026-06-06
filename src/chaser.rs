@@ -65,6 +65,18 @@ impl ChaserClient {
             .await
             .map_err(|e| anyhow!("source failed: {}", e))
     }
+
+    pub async fn post(
+        &self,
+        url: &str,
+        post_data: &str,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<SourceResponse> {
+        self.inner
+            .post_source(url, post_data, proxy.map(CfProxy::from))
+            .await
+            .map_err(|e| anyhow!("post failed: {}", e))
+    }
 }
 
 impl From<&ProxyConfig> for CfProxy {
