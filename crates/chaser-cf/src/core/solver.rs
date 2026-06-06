@@ -460,7 +460,8 @@ async fn is_cloudflare_block_page(page: &chaser_oxide::Page) -> bool {
             return true;
         }
     }
-    const PROBE: &str = "!!document.querySelector('.cf-error-code,.cf-error-details,#cf-error-details')";
+    const PROBE: &str =
+        "!!document.querySelector('.cf-error-code,.cf-error-details,#cf-error-details')";
     matches!(
         page.evaluate(PROBE)
             .await

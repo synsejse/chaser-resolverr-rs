@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use log::warn;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::chaser::ChaserClient;
 
