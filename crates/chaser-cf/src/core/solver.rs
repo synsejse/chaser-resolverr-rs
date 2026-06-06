@@ -15,7 +15,20 @@ const FAKE_PAGE_HTML: &str = include_str!("../resources/fake_page.html");
 /// or `responseStatus` is unavailable (e.g. file:// or about:blank).
 const NAVIGATION_STATUS_JS: &str = "(()=>{const n=performance.getEntriesByType('navigation')[0];return n&&typeof n.responseStatus==='number'?n.responseStatus:null;})()";
 
+/// How long `get_source` waits for a Cloudflare challenge to clear before
+/// giving up and reporting failure.
+const GET_SOURCE_CLEARANCE_TIMEOUT_SECS: u64 = 30;
+/// `solve_waf_session` allows longer — interactive Turnstile can take a
+/// while, and this call exists purely to mint a fresh `cf_clearance`.
+const WAF_SESSION_CLEARANCE_TIMEOUT_SECS: u64 = 90;
+
 /// Get the rendered HTML for `url` plus the HTTP status of the navigation.
+///
+/// Returns `CaptchaFailed` if the navigation lands on a Cloudflare challenge
+/// that is still unsolved when the clearance timeout expires — otherwise the
+/// caller would receive the "Just a moment…" interstitial HTML reported as a
+/// success, and downstream indexers would parse the challenge page as if it
+/// were the real content.
 pub async fn get_source(
     manager: &BrowserManager,
     url: &str,
@@ -32,7 +45,7 @@ pub async fn get_source(
         .await
         .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
 
-    wait_for_clearance(&page, &chaser, 30).await;
+    let outcome = wait_for_clearance(&page, &chaser, GET_SOURCE_CLEARANCE_TIMEOUT_SECS).await;
 
     let html = page
         .content()
@@ -45,6 +58,13 @@ pub async fn get_source(
         .ok()
         .and_then(|v| v?.as_u64())
         .and_then(|n| u16::try_from(n).ok());
+
+    if outcome == ClearanceOutcome::TimedOut {
+        return Err(ChaserError::CaptchaFailed(format!(
+            "Cloudflare challenge still unsolved after {GET_SOURCE_CLEARANCE_TIMEOUT_SECS}s (navigation status {})",
+            status.map_or_else(|| "unknown".to_string(), |s| s.to_string())
+        )));
+    }
 
     Ok(SourceResponse { html, status })
 }
@@ -68,7 +88,17 @@ pub async fn solve_waf_session(
         .await
         .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
 
-    wait_for_clearance(&page, &chaser, 90).await;
+    // Best-effort: even on timeout we return whatever cookies we have so
+    // the caller can still proceed (it tolerates a missing cf_clearance).
+    // get_source is the authoritative gate that fails the request when the
+    // challenge is genuinely unsolved.
+    if wait_for_clearance(&page, &chaser, WAF_SESSION_CLEARANCE_TIMEOUT_SECS).await
+        == ClearanceOutcome::TimedOut
+    {
+        tracing::warn!(
+            "waf-session for {url} timed out after {WAF_SESSION_CLEARANCE_TIMEOUT_SECS}s with the Cloudflare challenge still present; returning best-effort cookies"
+        );
+    }
 
     let raw_cookies = page
         .get_cookies()
@@ -210,6 +240,20 @@ async fn setup_proxy_auth(
     Ok(())
 }
 
+/// Outcome of [`wait_for_clearance`], so callers can tell a solved/non-CF
+/// page apart from a challenge we never got through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearanceOutcome {
+    /// `cf_clearance` appeared — the challenge was solved.
+    Cleared,
+    /// The page was never (or is no longer) a Cloudflare challenge, so there
+    /// is nothing to solve and the current HTML is the real content.
+    NotChallenged,
+    /// The timeout expired with a Cloudflare challenge still on screen and no
+    /// clearance cookie — the challenge was not solved.
+    TimedOut,
+}
+
 /// Poll until `cf_clearance` appears (meaning the challenge was solved) or the
 /// timeout expires.
 ///
@@ -222,7 +266,7 @@ async fn wait_for_clearance(
     page: &chaser_oxide::Page,
     chaser: &chaser_oxide::ChaserPage,
     timeout_seconds: u64,
-) {
+) -> ClearanceOutcome {
     const PASSIVE_WAIT_MS: u64 = 6_000;
     const CLICK_INTERVAL_MS: u64 = 1_200;
 
@@ -233,11 +277,17 @@ async fn wait_for_clearance(
     loop {
         if has_clearance_cookie(page).await {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            return;
+            return ClearanceOutcome::Cleared;
         }
 
         if started.elapsed() >= timeout {
-            return;
+            // Distinguish a genuine unsolved challenge from a non-CF page we
+            // happened to time out on: only the former is a failure.
+            return if is_cloudflare_challenge_page(page).await {
+                ClearanceOutcome::TimedOut
+            } else {
+                ClearanceOutcome::NotChallenged
+            };
         }
 
         // After the passive window: if neither a clearance cookie nor a
@@ -245,7 +295,7 @@ async fn wait_for_clearance(
         // and there is nothing for us to wait on.
         if started.elapsed().as_millis() as u64 >= PASSIVE_WAIT_MS {
             if !is_cloudflare_challenge_page(page).await {
-                return;
+                return ClearanceOutcome::NotChallenged;
             }
             if last_click.elapsed().as_millis() as u64 >= CLICK_INTERVAL_MS {
                 try_click_challenge(chaser).await;
